@@ -69,17 +69,16 @@ def sbs(lframe, rframe):
 
 class StereoImageDataset(Dataset):
     """
-    Load stereo pairs from a directory structure:
+    Load stereo pairs from the following directory structure:
 
     data_root/
-        left/
-            000001.jpg
-            000002.jpg
-            ...
-        right/
-            000001.jpg
-            000002.jpg
-            ...
+        1/
+            left/
+            right/
+        2/
+            left/
+            right/
+        ...
 
     Each pair has matching filenames. Images are loaded as float32 [0, 1] RGB.
     """
@@ -87,26 +86,61 @@ class StereoImageDataset(Dataset):
     def __init__(self, data_root, data_shape=(384, 160), test_mode=False):
         """
         Args:
-            data_root: root directory containing left/ and right/ subdirectories.
+            data_root: root directory containing clip subdirectories, each with left/ and right/.
             data_shape: (width, height) to resize images to.
             test_mode: if True, use center crop; otherwise random crop.
         """
         self.data_shape = data_shape  # (W, H)
         self.test_mode = test_mode
-
-        left_dir = os.path.join(data_root, 'left')
-        right_dir = os.path.join(data_root, 'right')
-
-        self.left_files = sorted([
-            os.path.join(left_dir, f) for f in os.listdir(left_dir)
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
-        ])
-        self.right_files = sorted([
-            os.path.join(right_dir, f) for f in os.listdir(right_dir)
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
-        ])
+        self.left_files, self.right_files = self._collect_pairs(data_root)
         assert len(self.left_files) == len(self.right_files), \
             f"Mismatch: {len(self.left_files)} left vs {len(self.right_files)} right images"
+        if len(self.left_files) == 0:
+            raise RuntimeError(f"No stereo image pairs found in: {data_root}")
+
+    @staticmethod
+    def _is_image_file(name):
+        return name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+
+    @classmethod
+    def _collect_from_lr_dirs(cls, left_dir, right_dir):
+        if not os.path.isdir(left_dir) or not os.path.isdir(right_dir):
+            return [], []
+
+        left_map = {
+            os.path.basename(f): os.path.join(left_dir, f)
+            for f in os.listdir(left_dir)
+            if cls._is_image_file(f)
+        }
+        right_map = {
+            os.path.basename(f): os.path.join(right_dir, f)
+            for f in os.listdir(right_dir)
+            if cls._is_image_file(f)
+        }
+
+        common_names = sorted(set(left_map.keys()) & set(right_map.keys()))
+        left_files = [left_map[name] for name in common_names]
+        right_files = [right_map[name] for name in common_names]
+        return left_files, right_files
+
+    @classmethod
+    def _collect_pairs(cls, data_root):
+        # Only support data_root/<clip_id>/left and data_root/<clip_id>/right.
+        left_all = []
+        right_all = []
+        clip_dirs = sorted([
+            os.path.join(data_root, d)
+            for d in os.listdir(data_root)
+            if os.path.isdir(os.path.join(data_root, d))
+        ])
+        for clip_dir in clip_dirs:
+            ldir = os.path.join(clip_dir, 'left')
+            rdir = os.path.join(clip_dir, 'right')
+            left_clip, right_clip = cls._collect_from_lr_dirs(ldir, rdir)
+            left_all.extend(left_clip)
+            right_all.extend(right_clip)
+
+        return left_all, right_all
 
     def __len__(self):
         return len(self.left_files)

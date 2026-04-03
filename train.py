@@ -12,21 +12,29 @@ import argparse
 import logging
 from datetime import datetime
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
 from model import Deep3DNet
-from dataset import StereoImageDataset, StereoVideoDataset, create_dataloader
+from dataset import StereoImageDataset, StereoVideoDataset, create_dataloader, anaglyph, sbs
+
+
+OUTPUT_ROOT = '/root/autodl-tmp/deep3d/data/exp'
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train Deep3D model')
+    default_data_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', 'data', 'train_set')
+    )
 
     # Data
-    parser.add_argument('--data_root', type=str, default=None,
-                        help='Root directory with left/ and right/ subdirectories')
+    parser.add_argument('--data_root', type=str, default=default_data_root,
+                        help='Root directory for stereo dataset (expects clip_id/left,right layout)')
     parser.add_argument('--video_path', type=str, default=None,
                         help='Path to a side-by-side 3D video file')
     parser.add_argument('--val_ratio', type=float, default=0.1,
@@ -53,7 +61,7 @@ def get_args():
                         help='Do not load pretrained VGG16 weights')
 
     # Output
-    parser.add_argument('--exp_dir', type=str, default='exp',
+    parser.add_argument('--exp_dir', type=str, default=OUTPUT_ROOT,
                         help='Experiment output directory')
     parser.add_argument('--prefix', type=str, default='deep3d')
     parser.add_argument('--log_interval', type=int, default=10,
@@ -85,6 +93,67 @@ def setup_logging(exp_dir, prefix):
             logging.StreamHandler(sys.stdout),
         ]
     )
+
+
+def build_run_dir(base_dir, prefix):
+    """Create per-run directory: base_dir/YYYYMMDD/prefix_HHMMSS."""
+    date_dir = datetime.now().strftime('%Y%m%d')
+    run_subdir = f"{prefix}_{datetime.now().strftime('%H%M%S')}"
+    run_dir = os.path.join(base_dir, date_dir, run_subdir)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def tensor_rgb_to_bgr_uint8(tensor):
+    """Convert CHW RGB tensor in [0,1] to HWC BGR uint8 image for OpenCV saving."""
+    arr = tensor.detach().cpu().numpy()
+    arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+    arr = arr.transpose(1, 2, 0)  # CHW -> HWC (RGB)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def draw_panel_label(img, text):
+    out = img.copy()
+    cv2.rectangle(out, (0, 0), (img.shape[1], 28), (0, 0, 0), thickness=-1)
+    cv2.putText(out, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
+@torch.no_grad()
+def save_pretrain_visualizations(model, dataset, device, output_dir, num_samples=5):
+    """Save first N visualizations before training starts for quick sanity checks."""
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+
+    n = min(num_samples, len(dataset))
+    if n == 0:
+        logging.warning('Dataset is empty. Skip pre-training visualization export.')
+        return
+
+    for i in range(n):
+        left, right = dataset[i]
+        pred = model(left.unsqueeze(0).to(device)).cpu()[0]
+
+        left_bgr = tensor_rgb_to_bgr_uint8(left)
+        right_bgr = tensor_rgb_to_bgr_uint8(right)
+        pred_bgr = tensor_rgb_to_bgr_uint8(pred)
+
+        ana_bgr = anaglyph(left_bgr, pred_bgr)
+        sbs_bgr = sbs(left_bgr, pred_bgr)
+
+        panels = [
+            draw_panel_label(left_bgr, 'left_input'),
+            draw_panel_label(right_bgr, 'right_gt'),
+            draw_panel_label(pred_bgr, 'right_pred_before_train'),
+            draw_panel_label(ana_bgr, 'anaglyph(left,pred)'),
+            draw_panel_label(sbs_bgr, 'sbs(left,pred)'),
+        ]
+        vis = np.concatenate(panels, axis=1)
+        out_path = os.path.join(output_dir, f'pretrain_vis_{i + 1:02d}.png')
+        cv2.imwrite(out_path, vis)
+
+    logging.info(f'Saved {n} pre-training visualizations to: {output_dir}')
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, log_interval):
@@ -138,7 +207,10 @@ def validate(model, dataloader, criterion, device):
 
 def main():
     args = get_args()
+    base_output_dir = args.exp_dir if args.exp_dir else OUTPUT_ROOT
+    args.exp_dir = build_run_dir(base_output_dir, args.prefix)
     setup_logging(args.exp_dir, args.prefix)
+    logging.info(f'Run output directory: {args.exp_dir}')
     logging.info(f'Arguments: {args}')
 
     # Device
@@ -180,6 +252,10 @@ def main():
         logging.info('Initializing with VGG16 pretrained weights...')
         model.init_weights()
     model = model.to(device)
+
+    # Save first 5 visualizations before training starts.
+    pretrain_vis_dir = os.path.join(args.exp_dir, 'pretrain_vis')
+    save_pretrain_visualizations(model, full_dataset, device, pretrain_vis_dir, num_samples=5)
 
     # Loss (L1 / MAE, matching original)
     criterion = nn.L1Loss()

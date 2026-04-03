@@ -24,18 +24,11 @@ deep3d_pytorch/
 ### 1. 创建 Conda 环境
 
 ```bash
-conda env create -f environment.yml
+conda create -n deep3d python=3.10
 conda activate deep3d
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
-
-> **注意**：如果没有 NVIDIA GPU 或需要使用不同 CUDA 版本，请修改 `environment.yml` 中的 `pytorch-cuda` 版本，或替换为 `cpuonly`：
-> ```yaml
-> # CPU 版本
-> dependencies:
->   - pytorch
->   - torchvision
->   - cpuonly
-> ```
 
 ### 2. 验证安装
 
@@ -50,10 +43,10 @@ python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.
 如果你有 Side-by-Side (SBS) 3D 视频文件：
 
 ```bash
-python preprocess.py movie_3d.mkv data/frames --sbs3d --auto_clip
+python preprocess.py movie_3d.mkv data/train_set/1 --sbs3d --auto_clip
 ```
 
-这将从视频中提取左右视图帧对，保存到 `data/frames/left/` 和 `data/frames/right/` 目录。
+这将从视频中提取左右视图帧对，保存到 `data/train_set/1/left/` 和 `data/train_set/1/right/` 目录。
 
 可选参数：
 - `--reshape 384 160`：输出帧尺寸（宽 高）
@@ -64,21 +57,26 @@ python preprocess.py movie_3d.mkv data/frames --sbs3d --auto_clip
 
 ### 方式二：图片目录
 
-将左右视图图片分别放入对应目录：
+仅支持以下目录结构（多片段）：
 
 ```
-data/frames/
-├── left/
-│   ├── 000001.jpg
-│   ├── 000002.jpg
-│   └── ...
-└── right/
-    ├── 000001.jpg
-    ├── 000002.jpg
-    └── ...
+data/train_set/
+├── 1/
+│   ├── left/
+│   │   ├── 1.jpg
+│   │   ├── 2.jpg
+│   │   └── ...
+│   └── right/
+│       ├── 1.jpg
+│       ├── 2.jpg
+│       └── ...
+├── 2/
+│   ├── left/
+│   └── right/
+└── ...
 ```
 
-左右目录中的文件名必须一一对应。
+每个片段内 left 和 right 按同名文件自动配对。
 
 ## 训练
 
@@ -86,16 +84,20 @@ data/frames/
 
 ```bash
 python train.py \
-    --data_root data/frames \
+    --data_root ../data/train_set \
     --batch_size 16 \
-    --epochs 100 \
+    --epochs 2 \
     --lr 0.002 \
     --lr_step 20 \
     --lr_factor 0.1 \
     --gpu 0 \
-    --exp_dir exp \
+    --exp_dir ../data/exp \
     --prefix deep3d
 ```
+
+说明：
+- 在 Deep3D_Pro 目录下运行时，默认 data_root 已设置为 ../data/train_set。
+- 即使不显式传 --data_root，也会读取同级 data/train_set。
 
 ### 从视频文件直接训练
 
@@ -111,7 +113,7 @@ python train.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--data_root` | - | 包含 left/ 和 right/ 子目录的数据根目录 |
+| `--data_root` | ../data/train_set | 数据根目录，仅支持 clip_id/left,right 结构 |
 | `--video_path` | - | SBS 3D 视频路径 |
 | `--batch_size` | 16 | 批大小 |
 | `--epochs` | 100 | 训练轮数 |
@@ -126,7 +128,7 @@ python train.py \
 ### 恢复训练
 
 ```bash
-python train.py --data_root data/frames --resume exp/deep3d-0050.pth
+python train.py --data_root ../data/train_set --resume exp/deep3d-0050.pth
 ```
 
 ### TensorBoard 监控
