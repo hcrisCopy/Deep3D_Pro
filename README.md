@@ -89,6 +89,52 @@ python inference/run_inference.py \
 - 当前推理输出为静音视频，不会保留源视频音轨。
 - 推理脚本不依赖 FFmpeg。
 
+## 测试评测
+
+针对你当前指定的数据集 `../data/test_set/mono2stereo_test`，项目已经补充了评测入口：
+
+```bash
+python inference/evaluate_mono2stereo.py \
+  --gpu_id 0 \
+  --model ../data/pretrained/deep3d_v1.0_1280x720_cuda.pt \
+  --data_root ../data/test_set/mono2stereo_test \
+  --out_root ../data/test_on_mono
+```
+
+评测流程与 `Mono2Stereo` 参考逻辑对齐为：
+
+- `mono2stereo_test` 被视作单图评测集，不再把不同图片拼成伪时序窗口。
+- 每张左图会被重复填入网络要求的 6 个输入槽位，独立生成对应的右图预测。
+- 先把测试图片统一调整到 `1280x800`。
+- 送入当前 TorchScript 权重前，再调整到权重固定要求的 `1280x720`。
+- 模型输出的右视图再放回 `1280x800` 后计算 `SSIM / PSNR / SIOU`。
+- 同时统计整套评测吞吐、纯模型前向速度，以及进程内存和 CUDA 显存占用。
+
+输出目录固定为：
+
+```text
+../data/test_on_mono/
+├── summary.json              # 总体指标、速度、内存/显存汇总
+├── per_clip_metrics.csv      # 每个子集的平均指标
+├── per_frame_metrics.csv     # 每一帧的详细指标和耗时
+├── predictions/              # 全量预测右视图
+└── visualizations/           # 每个子集抽样可视化拼图
+```
+
+可视化拼图会同时展示 `Left / Pred Right / GT Right / Pred-GT Diff / Anaglyph / Pred-Left Diff`，方便快速判断模型是否正常运行。当前这次实跑生成的样例包括：
+
+- `../data/test_on_mono/visualizations/animation/000000251_viz.jpg`
+- `../data/test_on_mono/visualizations/complex/000000230_viz.jpg`
+- `../data/test_on_mono/visualizations/indoor/000000440_viz.jpg`
+- `../data/test_on_mono/visualizations/outdoor/000002383_viz.jpg`
+- `../data/test_on_mono/visualizations/simple/00000001_viz.jpg`
+
+说明：
+
+- `FPS` 是整套评测循环的处理速度，包含数据搬运、resize、保存预测和指标计算。
+- `Model FPS` 只统计 `net(input_data)` 的纯前向时间。
+- 当前脚本会按子集预先载入并缓存图片，因此进程峰值内存会高于纯模型推理场景。
+
 ## 训练
 
 ### 训练数据集路径与目录结构
@@ -109,9 +155,6 @@ python inference/run_inference.py \
 ├── 2/
 │   ├── left/
 │   └── right/
-├── 3/
-│   ├── left/
-│   └── right/
 ...
 ├── 9/
 │   ├── left/
@@ -124,15 +167,7 @@ python inference/run_inference.py \
 │       ├── 2.png
 │       ├── 3.png
 │       └── ...
-├── 10/
-│   ├── left/
-│   └── right/
-├── 11/
-│   ├── left/
-│   └── right/
-└── 12/
-    ├── left/
-    └── right/
+
 ```
 
 数据组织规则：
@@ -169,7 +204,7 @@ python training/train.py \
   --pretrained ../data/pretrained/deep3d_v1.0_1280x720_cuda.pt \
   --exp_dir ../data/exp \
   --lr 1e-4 \
-  --epochs 50
+  --epochs 2
 ```
 
 从 checkpoint 恢复：
