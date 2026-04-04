@@ -111,13 +111,15 @@ def backwarp(img, flow):
     """
     N, _, H, W = flow.shape
 
-    # Build base grid in float32 first (matching JIT model precision),
-    # then convert to flow dtype to avoid fp16 linspace rounding issues.
-    grid_x = torch.linspace(-1.0, 1.0, W, dtype=torch.float32, device=flow.device)
+    # Build the base grid from tensors derived from flow so traced TorchScript
+    # keeps device placement dynamic instead of baking in the trace device.
+    grid_x = flow.new_ones((W,), dtype=torch.float32).cumsum(0) - 1.0
+    grid_x = grid_x / ((W - 1) / 2.0) - 1.0
     grid_x = grid_x.view(1, 1, 1, W).expand(N, -1, H, -1)
-    grid_y = torch.linspace(-1.0, 1.0, H, dtype=torch.float32, device=flow.device)
+    grid_y = flow.new_ones((H,), dtype=torch.float32).cumsum(0) - 1.0
+    grid_y = grid_y / ((H - 1) / 2.0) - 1.0
     grid_y = grid_y.view(1, 1, H, 1).expand(N, -1, -1, W)
-    base_grid = torch.cat([grid_x, grid_y], dim=1).to(flow.dtype)  # (N, 2, H, W)
+    base_grid = torch.cat([grid_x, grid_y], dim=1).type_as(flow)  # (N, 2, H, W)
 
     # Normalize flow to [-1, 1] range for grid_sample
     flow_norm = torch.empty_like(flow)
@@ -146,6 +148,7 @@ class Deep3DNet(nn.Module):
 
     def __init__(self):
         super().__init__()
+        self.flow_scale = float(FLOW_SCALE)
 
         # Block0: coarsest level (1/8 scale), input: 19ch (18 imgs + 1 onehot)
         # flow_out_scale = 2/spatial_scale = 16
@@ -196,8 +199,7 @@ class Deep3DNet(nn.Module):
         aft = imgs[:, 15:18]   # x5: far-after
 
         # Onehot indicator channel
-        onehot = torch.ones(N, 1, H, W, device=imgs.device,
-                            dtype=imgs.dtype) * FLOW_SCALE
+        onehot = imgs.new_full((N, 1, H, W), self.flow_scale)
 
         # ---- Block 0: coarsest estimation ----
         x = torch.cat([imgs, onehot], dim=1)  # (N, 19, H, W)
