@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -111,14 +112,48 @@ def make_anaglyph(left_bgr, right_bgr):
     return ana
 
 
+def build_export_model_name(data_shape, device):
+    width, height = data_shape
+    device_tag = 'cuda' if device.type == 'cuda' else 'cpu'
+    return f'deep3d_v1.0_{width}x{height}_{device_tag}.pt'
+
+
+def export_torchscript_model(model, output_path, data_shape, device):
+    width, height = data_shape
+    model_cpu = Deep3DNet()
+    model_cpu.load_state_dict({key: value.detach().cpu() for key, value in model.state_dict().items()})
+    model_cpu.eval()
+
+    example_input = torch.rand(1, 18, height, width, dtype=torch.float32)
+    with torch.no_grad():
+        scripted = torch.jit.trace(model_cpu, example_input)
+    scripted.save(output_path)
+    logging.info(f'Exported TorchScript model for {device.type}: {output_path}')
+
+
 @torch.no_grad()
-def save_visualizations(model, dataset, device, output_dir, epoch, num_samples=4):
+def select_low_loss_samples(model, dataset, device, criterion, num_samples) -> List[Tuple[int, float]]:
+    scored_samples = []
+    model.eval()
+
+    for idx in range(len(dataset)):
+        input_tensor, right_gt = dataset[idx]
+        pred = model(input_tensor.unsqueeze(0).to(device)).cpu()[0]
+        sample_loss = criterion(pred, right_gt).item()
+        scored_samples.append((idx, sample_loss))
+
+    scored_samples.sort(key=lambda item: item[1])
+    return scored_samples[:min(num_samples, len(scored_samples))]
+
+
+@torch.no_grad()
+def save_visualizations(model, dataset, device, output_dir, epoch, criterion, num_samples=4):
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
 
-    n = min(num_samples, len(dataset))
-    for i in range(n):
-        input_tensor, right_gt = dataset[i]
+    selected_samples = select_low_loss_samples(model, dataset, device, criterion, num_samples)
+    for rank, (sample_idx, sample_loss) in enumerate(selected_samples, start=1):
+        input_tensor, right_gt = dataset[sample_idx]
         pred = model(input_tensor.unsqueeze(0).to(device)).cpu()[0]
 
         left = input_tensor[9:12]
@@ -129,7 +164,10 @@ def save_visualizations(model, dataset, device, output_dir, epoch, num_samples=4
         ana_bgr = make_anaglyph(left_bgr, pred_bgr)
 
         vis = np.concatenate([left_bgr, gt_bgr, pred_bgr, ana_bgr], axis=1)
-        out_path = os.path.join(output_dir, f'epoch{epoch:03d}_sample{i + 1:02d}.png')
+        out_path = os.path.join(
+            output_dir,
+            f'epoch{epoch:03d}_rank{rank:02d}_idx{sample_idx:05d}_loss{sample_loss:.6f}.png',
+        )
         cv2.imwrite(out_path, vis)
 
     model.train()
@@ -236,11 +274,12 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info(f'Model params: {total_params:,} total, {trainable_params:,} trainable')
 
-    vis_dir = os.path.join(args.exp_dir, 'vis')
-    save_visualizations(model, full_dataset, device, vis_dir, epoch=0, num_samples=4)
-    logging.info(f'Saved initial visualizations to: {vis_dir}')
-
     criterion = nn.L1Loss()
+
+    vis_dir = os.path.join(args.exp_dir, 'vis')
+    save_visualizations(model, val_dataset, device, vis_dir, epoch=0,
+                        criterion=criterion, num_samples=4)
+    logging.info(f'Saved initial visualizations to: {vis_dir}')
 
     if args.optimizer == 'adam':
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -264,6 +303,9 @@ def main():
     writer = SummaryWriter(log_dir=os.path.join(args.exp_dir, 'tb_logs'))
 
     best_val_loss = float('inf')
+    best_checkpoint_path = os.path.join(args.exp_dir, f'{args.prefix}-best.pth')
+    best_export_name = build_export_model_name(data_shape, device)
+    best_export_path = os.path.join(args.exp_dir, best_export_name)
     for epoch in range(start_epoch, args.epochs):
         lr = scheduler.get_last_lr()[0]
         logging.info(f'Epoch {epoch + 1}/{args.epochs}, LR: {lr:.6f}')
@@ -280,8 +322,8 @@ def main():
         writer.add_scalar('LR', lr, epoch + 1)
 
         if (epoch + 1) % args.vis_interval == 0:
-            save_visualizations(model, full_dataset, device, vis_dir,
-                                epoch=epoch + 1, num_samples=4)
+            save_visualizations(model, val_dataset, device, vis_dir,
+                                epoch=epoch + 1, criterion=criterion, num_samples=4)
 
         if (epoch + 1) % args.save_interval == 0:
             ckpt_path = os.path.join(args.exp_dir, f'{args.prefix}-{epoch + 1:04d}.pth')
@@ -297,13 +339,16 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_path = os.path.join(args.exp_dir, f'{args.prefix}-best.pth')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'val_loss': val_loss,
-            }, best_path)
-            logging.info(f'New best model: {best_path} (val_loss={val_loss:.6f})')
+            }, best_checkpoint_path)
+            export_torchscript_model(model, best_export_path, data_shape, device)
+            logging.info(
+                f'New best model: {best_checkpoint_path} and {best_export_path} '
+                f'(val_loss={val_loss:.6f})'
+            )
 
     writer.close()
     logging.info('Training finished.')

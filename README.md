@@ -70,7 +70,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ```bash
 python inference/run_inference.py \
-  --model ../data/pretrained/deep3d_v1.0.pt \
+  --model ../data/pretrained/deep3d_v1.0_1280x720_cuda.pt \
   --video ./medias/wood.mp4 \
   --out ../data/results/wood.mp4
 ```
@@ -233,7 +233,20 @@ python training/train.py \
 | `--resume` | `None` | checkpoint 路径 |
 | `--gpu` | `0` | GPU 编号，`-1` 为 CPU |
 
-如果显式传入 `--exp_dir ../data/exp`，训练输出会统一保存在 `../data/exp/<日期>/<实验名>/`，其中包含日志、TensorBoard 文件、可视化结果和 checkpoint。
+如果显式传入 `--exp_dir ../data/exp`，训练输出会统一保存在 `../data/exp/<日期>/<实验名>/`，其中包含日志、TensorBoard 文件、可视化结果、checkpoint，以及一份可直接被推理脚本加载的最佳 TorchScript 权重。
+
+训练目录中的关键产物如下：
+
+```text
+../data/exp/<日期>/<实验名>/
+├── deep3d-best.pth                     # 最佳 checkpoint，便于继续训练或恢复
+├── deep3d_v1.0_<W>x<H>_<device>.pt    # 最佳 TorchScript 权重，命名风格与官方权重一致
+├── deep3d-0005.pth                    # 按 save_interval 周期保存的 checkpoint
+├── tb_logs/                           # TensorBoard 日志
+└── vis/                               # 可视化结果
+```
+
+其中 `deep3d_v1.0_<W>x<H>_<device>.pt` 会根据 `--data_shape` 和当前训练设备自动生成，例如 `deep3d_v1.0_1280x720_cuda.pt` 或 `deep3d_v1.0_640x360_cpu.pt`。`vis/` 中不再固定保存前几张样本，而是每次从验证集中挑选当前 L1 Loss 最低的几张，文件名里会带上 rank、样本索引和 loss，方便快速筛查表现最稳定的样本。
 
 ## 方法流程
 
@@ -311,8 +324,9 @@ python training/train.py \
 5. 每个 epoch 依次完成训练、验证、学习率更新。
 6. 定期保存：
    - checkpoint：`deep3d-xxxx.pth`
-   - 最优模型：`deep3d-best.pth`
-   - 可视化图：左图、GT 右图、预测右图、红蓝立体图拼接结果
+   - 最优 checkpoint：`deep3d-best.pth`
+   - 最优 TorchScript 权重：`deep3d_v1.0_<W>x<H>_<device>.pt`
+   - 可视化图：从验证集中挑选当前 L1 Loss 最低的几张，展示左图、GT 右图、预测右图、红蓝立体图拼接结果
    - TensorBoard 日志
 
 默认输出目录结构为：
