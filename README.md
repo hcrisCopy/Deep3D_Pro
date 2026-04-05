@@ -72,6 +72,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python inference/run_inference.py \
   --model ../data/pretrained/deep3d_v1.0_1280x720_cuda.pt \
   --video ./medias/wood.mp4 \
+  --resize 1280 720 \
   --out ../data/results/wood.mp4
 ```
 
@@ -88,6 +89,7 @@ python inference/run_inference.py \
 
 - 当前推理输出为静音视频，不会保留源视频音轨。
 - 推理脚本不依赖 FFmpeg。
+- 如果使用官方 `deep3d_v1.0_1280x720_cuda.pt`，模型前向会固定按 `1280x720` 运行；当前 `run_inference.py` 会从模型文件名自动解析这一尺寸，并在写视频前再恢复到 `--resize` 指定的输出尺寸。
 
 ## 测试评测
 
@@ -134,6 +136,73 @@ python inference/evaluate_mono2stereo.py \
 - `FPS` 是整套评测循环的处理速度，包含数据搬运、resize、保存预测和指标计算。
 - `Model FPS` 只统计 `net(input_data)` 的纯前向时间。
 - 当前脚本会按子集预先载入并缓存图片，因此进程峰值内存会高于纯模型推理场景。
+
+## 1080p 连续帧测速
+
+针对 `../data/test_set/speed_test` 这种按训练集编号方式组织、但内容是连续视频帧的目录，项目已经补充测速入口：
+
+```bash
+python inference/benchmark_speed.py \
+  --gpu_id 0 \
+  --model ../data/pretrained/deep3d_v1.0_1280x720_cuda.pt \
+  --data_root ../data/test_set/speed_test \
+  --out_root ../data/test_on_speed \
+  --fps 25
+```
+
+测速逻辑说明：
+
+- 每个一级编号目录会被视作一段“视频”，例如 `11/left/*.png`。
+- `--out_root` 现在表示“测速实验总目录”，每次运行都会在其下自动新建一个时间戳子目录，例如 `../data/test_on_speed/20260405_123456/`，避免不同实验互相覆盖。
+- 输入帧默认保持原始分辨率写出，因此当前 `1920x1080` 连续帧会输出为高 `1080` 的左右拼接立体视频。
+- 模型前向仍按 TorchScript 权重要求走 `1280x720`，预测出的右视图再拉回原始输出分辨率后写视频。
+- 当前输出视频是左右拼接格式，因此 `1080p` 输入最终会得到 `3840x1080` 的 side-by-side 结果；高度保持 `1080`，便于直接观察左右眼内容。
+- 会同时统计整条推理流水线速度、纯模型前向速度、预热后稳态速度，以及进程内存 / CUDA 显存峰值。
+- 如果测试集里存在 `right/` 真值帧，可视化会额外展示 `GT Right` 和 `Pred-GT Diff`，方便确认结果是否跑对。
+
+输出目录固定为：
+
+```text
+../data/test_on_speed/
+└── 20260405_123456/
+    ├── summary.json              # 总体 FPS、延迟、显存/内存、模型体积汇总
+    ├── per_clip_speed.csv        # 每个编号片段的速度统计
+    ├── per_frame_speed.csv       # 每一帧 wall/model 耗时明细
+    ├── videos/                   # 每个编号片段的左右拼接立体视频
+    ├── visualizations/           # 每个编号片段抽样可视化
+    └── pred_right_frames/        # 仅在 --save_pred_frames 时导出
+```
+
+和端侧 500MB 约束直接相关的字段主要看：
+
+- `summary.json -> memory.process_peak_mb_after`：整条 benchmark 进程的宿主内存峰值。
+- `summary.json -> memory.gpu.max_reserved_mb`：CUDA 推理时的显存峰值保留量。
+- `summary.json -> memory.model_file_mb`：TorchScript 模型文件本身体积。
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--run_name` | 手动指定本次测速结果目录名；不传时自动使用时间戳 |
+| `--fps` | 帧目录导出视频时使用的帧率，默认 `25` |
+| `--alpha` | 时序窗口远前/远后帧偏移，默认 `5` |
+| `--model_size WIDTH HEIGHT` | 模型推理尺寸；默认从模型文件名自动解析，例如 `..._1280x720_...` |
+| `--output_size WIDTH HEIGHT` | 最终写视频分辨率，默认跟输入帧一致 |
+| `--warmup_frames` | 统计稳态 FPS 时忽略的前几帧，默认 `10` |
+| `--sample_vis_per_clip` | 每个片段保存多少张可视化，默认 `3` |
+| `--save_pred_frames` | 额外保存每一帧预测右图 |
+
+如果希望实验目录名可读、可复现，也可以显式传入：
+
+```bash
+python inference/benchmark_speed.py \
+  --gpu_id 0 \
+  --model ../data/pretrained/deep3d_v1.0_1280x720_cuda.pt \
+  --data_root ../data/test_set/speed_test \
+  --out_root ../data/test_on_speed \
+  --run_name 20260405_rtx4090_fp16 \
+  --fps 25
+```
 
 ## 训练
 
@@ -184,7 +253,7 @@ python inference/evaluate_mono2stereo.py \
 补充说明：
 
 - 边界帧不会被丢弃。代码在 `t=0`、`t=n-1` 等位置会采用首尾帧夹取补齐的方式构造时序窗口。
-- 当前 `train.py` 的参数默认值仍写的是项目内路径，但按当前目录约定，实际使用时建议始终显式传入 `--data_root ../data/train_set`。
+- 当前 `train.py` 默认已经对齐到仓库同级 `../data/train_set` 与 `../data/exp` 目录。
 
 ### 训练命令
 
@@ -219,7 +288,7 @@ python training/train.py \
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
-| `--data_root` | `./data/train_set` | 参数默认值仍指向项目内目录；实际使用建议显式传入 `../data/train_set` |
+| `--data_root` | `../data/train_set` | 训练集根目录 |
 | `--val_ratio` | `0.1` | 验证集比例 |
 | `--data_shape` | `640 360` | 输入分辨率，顺序为宽、高 |
 | `--alpha` | `5` | 远前帧和远后帧的偏移 |
@@ -274,9 +343,8 @@ python training/train.py \
 
 1. 使用 OpenCV 读取 BGR 图像。
 2. 按目标分辨率统一 resize。
-3. 转为 RGB。
-4. 归一化到 `[0, 1]`。
-5. 调整为 PyTorch 张量格式 `(C, H, W)`。
+3. 归一化到 `[0, 1]`。
+4. 调整为 PyTorch 张量格式 `(C, H, W)`。
 
 在训练集中，6 张参考帧会拼接成一个 `18` 通道输入张量 `(18, H, W)`；当前右视图 `R(t)` 作为监督目标 `(3, H, W)`。
 
@@ -362,7 +430,7 @@ python training/train.py \
 
 ## 与老版 Deep3D 的异同
 
-仓库根目录下的老版 `deep3d` 代码，主要对应早期 MXNet 版本的 Deep3D 思路：训练入口是 `train.py`，推理入口是 `convert_movie.py`，底层依赖 `data/lmdb` 数据、MXNet 符号图和早期多视差生成方式。`Deep3D_Pro` 则是重新整理后的 PyTorch 版本，但它不是对老版代码的逐文件迁移，而是方法层面已经发生了明显演化。
+这里的“老版 Deep3D”特指同级目录下的 `/root/autodl-tmp/deep3d/deep3d`。它是原始 MXNet 版 Deep3D 工程，包含 `train.py`、`convert_movie.py`、`data.py`、`sym.py`、`operators/` 等文件；`Deep3D_Pro` 则是围绕你当前这份反推 PyTorch 权重与训练链路整理出来的工程化版本。
 
 ### 相同点
 
@@ -374,16 +442,16 @@ python training/train.py \
 
 | 维度 | Deep3D_Pro | 老版 deep3d |
 |---|---|---|
-| 框架 | PyTorch | MXNet |
+| 框架 | PyTorch | PyTorch |
 | 训练数据组织 | 普通文件夹：`片段/left/right` | `LMDB` 数据库 |
-| 输入形式 | 6 帧时序 RGB，共 18 通道 | 以单帧为主，`data_frames=1` |
+| 输入形式 | 6 帧时序 BGR，共 18 通道 | 以单帧为主，`data_frames=1` |
 | 时序建模 | 显式引入前后帧与上一帧预测 | 基本按单帧或弱时序方式处理 |
 | 历史状态 | 有 `x0`，训练/推理构成时序闭环 | 无明显自回归右视图状态 |
-| 几何表达 | 4 组 flow + 3 通道 mask | 更接近传统 Deep3D 的视差/位移分布思想 |
-| 输出生成方式 | backward warp 多参考帧后融合 | 依赖旧版网络符号图生成右图 |
-| 网络结构 | 4 级 coarse-to-fine refinement | 早期静态符号网络 |
+| 几何表达 | 4 组 flow + 3 通道 mask | 更接近传统 Deep3D 的离散视差/位移分布 |
+| 输出生成方式 | backward warp 多参考帧后融合 | 依赖旧版符号图与后处理脚本生成右图 |
+| 网络结构 | 4 级 coarse-to-fine refinement | MXNet 符号网络 |
 | 工程可维护性 | 目录清晰，训练/推理职责分离 | 历史脚本式组织较重 |
-| 推理输出 | 默认直接输出无声 SBS 视频 | 老版脚本更偏研究/demo 工作流 |
+| 推理输出 | 默认直接输出无声 SBS 视频 | `convert_movie.py` 更偏研究/demo 工作流 |
 
 ### 方法层面的核心差异
 
@@ -413,9 +481,7 @@ python training/train.py \
 
 #### 4. 数据与工程链路差异
 
-老版代码训练依赖 `data/lmdb`，并使用 MXNet 的 `FeedForward` 与符号式网络定义，今天维护和扩展的门槛都比较高。
-
-`Deep3D_Pro` 使用标准 PyTorch 数据集、DataLoader、checkpoint、TensorBoard 和 TorchScript 推理接口，迁移、调参、断点恢复和二次开发都更直接，也更适合当前工程环境。
+老版 `/root/autodl-tmp/deep3d/deep3d` 的训练依赖 `data/lmdb`，并使用 MXNet 的 `FeedForward`、符号图 `sym.py` 以及自定义算子 `operators/depth_dot.*`。相比之下，`Deep3D_Pro` 使用标准 PyTorch 数据集、DataLoader、checkpoint、TensorBoard 和 TorchScript 推理接口，把训练、评测和测速补齐后，更适合当前工程环境里的迁移、调参、断点恢复和二次开发。
 
 ### 可以怎样理解两者关系
 

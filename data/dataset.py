@@ -8,6 +8,7 @@ Each training sample provides:
 
 import os
 import random
+import re
 
 import cv2
 import numpy as np
@@ -17,6 +18,10 @@ from torch.utils.data import Dataset, DataLoader
 
 def _is_image_file(name):
     return name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+
+
+def _natural_key(name):
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)', name)]
 
 
 class TemporalStereoDataset(Dataset):
@@ -56,7 +61,7 @@ class TemporalStereoDataset(Dataset):
     @classmethod
     def _load_clips(cls, data_root):
         clips = []
-        for clip_name in sorted(os.listdir(data_root)):
+        for clip_name in sorted(os.listdir(data_root), key=_natural_key):
             clip_dir = os.path.join(data_root, clip_name)
             if not os.path.isdir(clip_dir):
                 continue
@@ -65,9 +70,9 @@ class TemporalStereoDataset(Dataset):
             if not os.path.isdir(left_dir) or not os.path.isdir(right_dir):
                 continue
 
-            left_files = sorted([f for f in os.listdir(left_dir) if _is_image_file(f)])
-            right_files = sorted([f for f in os.listdir(right_dir) if _is_image_file(f)])
-            common = sorted(set(left_files) & set(right_files))
+            left_files = sorted([f for f in os.listdir(left_dir) if _is_image_file(f)], key=_natural_key)
+            right_files = sorted([f for f in os.listdir(right_dir) if _is_image_file(f)], key=_natural_key)
+            common = sorted(set(left_files) & set(right_files), key=_natural_key)
 
             if len(common) > 0:
                 clips.append({
@@ -138,17 +143,16 @@ class TemporalStereoDataset(Dataset):
             raise RuntimeError(f'Cannot read image: {path}')
         W, H = self.data_shape
         img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LANCZOS4)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
         return torch.from_numpy(img.transpose(2, 0, 1))  # (3, H, W)
 
 
-def create_dataloader(dataset, batch_size, shuffle=True, num_workers=4, pin_memory=True):
+def create_dataloader(dataset, batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=False):
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=drop_last,
     )

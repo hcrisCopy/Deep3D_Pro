@@ -23,12 +23,13 @@ from data.dataset import TemporalStereoDataset, create_dataloader
 from models.deep3d_network import Deep3DNet, load_pretrained_jit
 
 
-OUTPUT_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'exp'))
+WORKSPACE_ROOT = PROJECT_ROOT.parent
+OUTPUT_ROOT = os.path.abspath(os.path.join(WORKSPACE_ROOT, 'data', 'exp'))
 
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train Deep3D_Pro model')
-    default_data_root = os.path.abspath(os.path.join(PROJECT_ROOT, 'data', 'train_set'))
+    default_data_root = os.path.abspath(os.path.join(WORKSPACE_ROOT, 'data', 'train_set'))
 
     parser.add_argument('--data_root', type=str, default=default_data_root,
                         help='Root directory for stereo dataset (clip_id/left,right layout)')
@@ -101,8 +102,7 @@ def build_run_dir(base_dir, prefix):
 def tensor_to_bgr_uint8(tensor):
     arr = tensor.detach().cpu().clamp(0, 1).numpy()
     arr = (arr * 255).astype(np.uint8)
-    arr = arr.transpose(1, 2, 0)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return arr.transpose(1, 2, 0)
 
 
 def make_anaglyph(left_bgr, right_bgr):
@@ -254,9 +254,9 @@ def main():
     logging.info(f'Dataset: {n} total, {n_train} train, {n_val} val')
 
     train_loader = create_dataloader(train_dataset, args.batch_size,
-                                     shuffle=True, num_workers=args.num_workers)
+                                     shuffle=True, num_workers=args.num_workers, drop_last=True)
     val_loader = create_dataloader(val_dataset, args.batch_size,
-                                   shuffle=False, num_workers=args.num_workers)
+                                   shuffle=False, num_workers=args.num_workers, drop_last=False)
 
     model = Deep3DNet()
 

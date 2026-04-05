@@ -5,6 +5,9 @@ and produces a silent side-by-side stereo video.
 """
 
 import argparse
+import numpy as np
+import os
+import re
 import sys
 from collections import deque
 from pathlib import Path
@@ -34,6 +37,8 @@ def parse_args():
                         help="Temporal offset for far-before and far-after frames.")
     parser.add_argument("--resize", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=None,
                         help="Optional output size. Defaults to the input video resolution.")
+    parser.add_argument("--model_size", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"), default=None,
+                        help="Optional model input size. Defaults to parsing WIDTHxHEIGHT from the model filename.")
     parser.add_argument("--inv", action="store_true",
                         help="Reverse left and right views in the final side-by-side output.")
     return parser.parse_args()
@@ -74,13 +79,33 @@ def get_device(gpu_id):
     return torch.device("cpu")
 
 
+def infer_model_size(model_path):
+    match = re.search(r'_(\d+)x(\d+)_', os.path.basename(model_path))
+    if match is None:
+        raise ValueError(
+            "Cannot infer model input size from filename. Please pass --model_size WIDTH HEIGHT."
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def prepare_tensor(frame_tensor, process, device, model_size):
+    if (frame_tensor.shape[1], frame_tensor.shape[0]) != model_size:
+        frame_np = cv2.resize(frame_tensor.numpy(), model_size, interpolation=cv2.INTER_LANCZOS4)
+        frame_tensor = torch.from_numpy(frame_np)
+    frame_tensor = frame_tensor.to(device)
+    if device.type == "cuda":
+        frame_tensor = frame_tensor.half()
+    return process(frame_tensor)
+
+
 def main():
     args = parse_args()
 
     device = get_device(args.gpu_id)
     metadata = get_video_metadata(args.video)
-    target_size = tuple(args.resize) if args.resize else (metadata["width"], metadata["height"])
-    target_width, target_height = target_size
+    output_size = tuple(args.resize) if args.resize else (metadata["width"], metadata["height"])
+    model_size = tuple(args.model_size) if args.model_size else infer_model_size(args.model)
+    output_width, output_height = output_size
 
     net = torch.jit.load(args.model, map_location="cpu")
     process = PreProcess()
@@ -96,13 +121,10 @@ def main():
         raise RuntimeError(f"Cannot open video: {args.video}")
 
     ensure_parent_dir(args.out)
-    window, last_frame = build_initial_window(cap, args.alpha, target_size)
-    writer = create_video_writer(args.out, metadata["fps"], (target_width * 2, target_height))
+    window, last_frame = build_initial_window(cap, args.alpha, output_size)
+    writer = create_video_writer(args.out, metadata["fps"], (output_width * 2, output_height))
 
-    x0 = window[args.alpha].to(device)
-    if device.type == "cuda":
-        x0 = x0.half()
-    x0 = process(x0)
+    x0 = prepare_tensor(window[args.alpha], process, device, model_size)
 
     for _ in tqdm(range(metadata["frame_count"]), desc="Inference"):
         if args.alpha > 0:
@@ -114,24 +136,22 @@ def main():
         else:
             x1 = x2 = x3 = x4 = x5 = window[0]
 
-        frames = [x1, x2, x3, x4, x5]
-        frames = [frame.to(device) for frame in frames]
-        if device.type == "cuda":
-            frames = [frame.half() for frame in frames]
-        x1, x2, x3, x4, x5 = [process(frame) for frame in frames]
+        x1, x2, x3, x4, x5 = [prepare_tensor(frame, process, device, model_size) for frame in (x1, x2, x3, x4, x5)]
 
         input_data = torch.cat((x1, x2, x0, x3, x4, x5), dim=0).unsqueeze(0)
         with torch.no_grad():
             out = net(input_data)
             x0 = out[0].detach()
 
-        left = x3
-        right = out[0]
-        stereo_pair = torch.cat((right, left), dim=2) if args.inv else torch.cat((left, right), dim=2)
-        writer.write(tensor2im(stereo_pair))
+        left = tensor2im(x3)
+        right = tensor2im(out[0])
+        if (right.shape[1], right.shape[0]) != output_size:
+            right = cv2.resize(right, output_size, interpolation=cv2.INTER_LANCZOS4)
+        stereo_pair = np.concatenate((right, left), axis=1) if args.inv else np.concatenate((left, right), axis=1)
+        writer.write(stereo_pair)
 
         if args.alpha > 0:
-            next_frame = read_frame(cap, target_size)
+            next_frame = read_frame(cap, output_size)
             if next_frame is None:
                 next_frame = last_frame
             else:

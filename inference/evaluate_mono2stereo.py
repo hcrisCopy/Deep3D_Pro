@@ -121,7 +121,6 @@ def read_frame(path, target_size=None):
         raise RuntimeError(f"Cannot read image: {path}")
     if target_size is not None:
         frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_LANCZOS4)
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return frame
 
 
@@ -188,14 +187,13 @@ def save_visualization(save_path, left, pred, target):
     diff_pred_gt = cv2.absdiff(pred, target)
     diff_pred_left = cv2.absdiff(pred, left)
 
-    diff_gray = cv2.cvtColor(diff_pred_gt, cv2.COLOR_RGB2GRAY)
+    diff_gray = cv2.cvtColor(diff_pred_gt, cv2.COLOR_BGR2GRAY)
     diff_color = cv2.applyColorMap(diff_gray, cv2.COLORMAP_HOT)
-    diff_color = cv2.cvtColor(diff_color, cv2.COLOR_BGR2RGB)
 
     anaglyph = np.zeros_like(pred)
-    anaglyph[:, :, 0] = left[:, :, 0]
+    anaglyph[:, :, 0] = pred[:, :, 0]
     anaglyph[:, :, 1] = pred[:, :, 1]
-    anaglyph[:, :, 2] = pred[:, :, 2]
+    anaglyph[:, :, 2] = left[:, :, 2]
 
     h, w = left.shape[:2]
     canvas = np.zeros((h * 2, w * 3, 3), dtype=np.uint8)
@@ -235,7 +233,7 @@ def save_visualization(save_path, left, pred, target):
             cv2.LINE_AA,
         )
 
-    cv2.imwrite(str(save_path), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(save_path), canvas)
 
 
 def get_process_peak_memory_mb():
@@ -329,9 +327,9 @@ def main():
             frame_candidates = [current_left] * 6
 
             input_tensors = []
-            for frame_rgb in frame_candidates:
-                model_rgb = cv2.resize(frame_rgb, model_size, interpolation=cv2.INTER_LANCZOS4) if (frame_rgb.shape[1], frame_rgb.shape[0]) != model_size else frame_rgb
-                frame_tensor = torch.from_numpy(model_rgb).to(device)
+            for frame_bgr in frame_candidates:
+                model_bgr = cv2.resize(frame_bgr, model_size, interpolation=cv2.INTER_LANCZOS4) if (frame_bgr.shape[1], frame_bgr.shape[0]) != model_size else frame_bgr
+                frame_tensor = torch.from_numpy(model_bgr).to(device)
                 if device.type == "cuda":
                     frame_tensor = frame_tensor.half()
                 frame_tensor = process(frame_tensor)
@@ -347,27 +345,23 @@ def main():
                 torch.cuda.synchronize(device)
             infer_seconds = time.perf_counter() - infer_start
 
-            pred_rgb = tensor2im(out[0])
-            if (pred_rgb.shape[1], pred_rgb.shape[0]) != eval_size:
-                pred_rgb = cv2.resize(pred_rgb, eval_size, interpolation=cv2.INTER_LANCZOS4)
-            left_rgb = left_frames[frame_idx]
-            right_rgb = right_frames[frame_idx]
-            metrics = eval_stereo(
-                cv2.cvtColor(pred_rgb, cv2.COLOR_RGB2BGR),
-                cv2.cvtColor(right_rgb, cv2.COLOR_RGB2BGR),
-                cv2.cvtColor(left_rgb, cv2.COLOR_RGB2BGR),
-            )
+            pred_bgr = tensor2im(out[0])
+            if (pred_bgr.shape[1], pred_bgr.shape[0]) != eval_size:
+                pred_bgr = cv2.resize(pred_bgr, eval_size, interpolation=cv2.INTER_LANCZOS4)
+            left_bgr = left_frames[frame_idx]
+            right_bgr = right_frames[frame_idx]
+            metrics = eval_stereo(pred_bgr, right_bgr, left_bgr)
 
             for key, value in metrics.items():
                 overall_metrics[key] += value
                 clip_metric_sums[key] += value
 
             pred_path = clip_pred_dir / clip["left"][frame_idx].name
-            cv2.imwrite(str(pred_path), cv2.cvtColor(pred_rgb, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(pred_path), pred_bgr)
 
             if frame_idx in sample_indices:
                 vis_path = clip_vis_dir / f"{clip['left'][frame_idx].stem}_viz.jpg"
-                save_visualization(vis_path, left_rgb, pred_rgb, right_rgb)
+                save_visualization(vis_path, left_bgr, pred_bgr, right_bgr)
 
             wall_seconds = time.perf_counter() - wall_start
             clip_model_seconds += infer_seconds
