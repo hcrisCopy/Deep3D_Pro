@@ -1,13 +1,21 @@
-"""Benchmark Deep3D_Pro on sequential 1080p frame folders.
+"""Benchmark Deep3D_Pro fast mode on sequential frame folders.
 
-The benchmark treats each clip folder under ``data_root`` as a video sequence:
+Fast mode lowers the model input resolution without retraining, then upsamples
+the predicted right-eye frame back to the requested output size. The default is
+960x540 model input and 1920x1080 output. For a stronger speed/quality tradeoff,
+run with ``--model_size 640 360``.
 
-    clip_id/
-      left/*.png
-      right/*.png
+The output layout and printed JSON summary intentionally follow the baseline
+speed benchmark format:
 
-It runs temporal inference from left frames, writes a side-by-side stereo video,
-collects latency / FPS / memory stats, and saves a few visualization panels.
+    OUT_ROOT/YYYYMMDD/HHMMSS_fast_960x540_to_1920x1080/
+      videos/*.mp4
+      visualizations/*/*.jpg
+      pred_right_frames/*/*.png        # only with --save_pred_frames
+      exported_models/*.pt
+      summary.json
+      per_clip_speed.csv
+      per_frame_speed.csv
 """
 
 import argparse
@@ -32,17 +40,23 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.transforms import PreProcess, tensor2im
+from models.deep3d_network import Deep3DNet, load_pretrained_jit
 from tools.file_utils import ensure_dir
 from tools.video_utils import create_video_writer
 
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp")
-SIMULATED_1080P_SIZE = (1920, 1080)
+DEFAULT_MODEL_SIZE = (960, 540)
+DEFAULT_OUTPUT_SIZE = (1920, 1080)
+BASELINE_720P_MODEL_SIZE = (1280, 720)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark Deep3D_Pro on sequential frame folders and export stereo videos."
+        description=(
+            "Benchmark Deep3D_Pro fast mode: lower model input resolution, "
+            "then upsample outputs to 1080p."
+        )
     )
     parser.add_argument("--gpu_id", default=0, type=int, help="GPU device id, use -1 for CPU.")
     parser.add_argument(
@@ -61,13 +75,19 @@ def parse_args():
         "--out_root",
         default="../data/test_on_speed",
         type=str,
-        help="Parent directory for benchmark runs. Outputs are saved under OUT_ROOT/YYYYMMDD/HHMMSS_baseline by default.",
+        help=(
+            "Parent directory for benchmark runs. Outputs are saved under "
+            "OUT_ROOT/YYYYMMDD/HHMMSS_fast_WIDTHxHEIGHT_to_1920x1080 by default."
+        ),
     )
     parser.add_argument(
         "--run_name",
         default=None,
         type=str,
-        help="Optional run folder name under the date directory. Defaults to HHMMSS_baseline in UTC.",
+        help=(
+            "Optional run folder name under the date directory. Defaults to "
+            "HHMMSS_fast_WIDTHxHEIGHT_to_OUTPUT_WIDTHxOUTPUT_HEIGHT in UTC."
+        ),
     )
     parser.add_argument(
         "--fps",
@@ -81,16 +101,19 @@ def parse_args():
         type=int,
         nargs=2,
         metavar=("WIDTH", "HEIGHT"),
-        default=None,
-        help="Inference resolution expected by the TorchScript model. Defaults to parsing WIDTHxHEIGHT from the model filename.",
+        default=DEFAULT_MODEL_SIZE,
+        help=(
+            "Fast-mode inference resolution. Defaults to 960 540; use 640 360 "
+            "for a stronger speed/quality tradeoff."
+        ),
     )
     parser.add_argument(
         "--output_size",
         type=int,
         nargs=2,
         metavar=("WIDTH", "HEIGHT"),
-        default=None,
-        help="Final left/right frame size before video writing. Defaults to the source resolution.",
+        default=DEFAULT_OUTPUT_SIZE,
+        help="Final left/right frame size before video writing. Defaults to 1920 1080.",
     )
     parser.add_argument(
         "--warmup_frames",
@@ -119,7 +142,10 @@ def parse_args():
         "--current_device_tops",
         default=None,
         type=float,
-        help="Optional TOPS/TOPS-equivalent of the current test device. If provided, the script estimates 4T-device FPS by linear scaling.",
+        help=(
+            "Optional TOPS/TOPS-equivalent of the current test device. If provided, "
+            "the script estimates 4T-device FPS by linear scaling."
+        ),
     )
     parser.add_argument(
         "--target_fps",
@@ -142,15 +168,6 @@ def resolve_path(path_str):
     if path.is_absolute():
         return path
     return (PROJECT_ROOT / path).resolve()
-
-
-def infer_model_size(model_path):
-    match = re.search(r"_(\d+)x(\d+)_", os.path.basename(str(model_path)))
-    if match is None:
-        raise ValueError(
-            "Cannot infer model input size from filename. Please pass --model_size WIDTH HEIGHT."
-        )
-    return int(match.group(1)), int(match.group(2))
 
 
 def to_project_relative(path):
@@ -271,15 +288,6 @@ def read_bgr_frame(path, target_size=None):
     return frame
 
 
-def resolve_benchmark_output_size(args, first_frame):
-    if args.output_size:
-        return tuple(args.output_size), False
-    source_size = (first_frame.shape[1], first_frame.shape[0])
-    if source_size != SIMULATED_1080P_SIZE:
-        return SIMULATED_1080P_SIZE, True
-    return source_size, False
-
-
 def build_frame_window(frame_paths, alpha, target_size):
     first_frame = torch.from_numpy(read_bgr_frame(frame_paths[0], target_size))
     window = deque([first_frame] * alpha)
@@ -298,8 +306,8 @@ def build_frame_window(frame_paths, alpha, target_size):
     return window, preload_end, last_frame
 
 
-def prepare_tensor(frame_tensor, process, device, model_size=None):
-    if model_size is not None and (frame_tensor.shape[1], frame_tensor.shape[0]) != model_size:
+def prepare_tensor(frame_tensor, process, device, model_size):
+    if (frame_tensor.shape[1], frame_tensor.shape[0]) != model_size:
         frame_np = cv2.resize(frame_tensor.numpy(), model_size, interpolation=cv2.INTER_LANCZOS4)
         frame_tensor = torch.from_numpy(frame_np)
     frame_tensor = frame_tensor.to(device, non_blocking=device.type == "cuda")
@@ -344,6 +352,27 @@ def safe_div(numerator, denominator):
     if denominator in (0, 0.0, None):
         return None
     return numerator / denominator
+
+
+def summarize_timings(seconds_list):
+    if not seconds_list:
+        return {
+            "count": 0,
+            "avg_ms": 0.0,
+            "p50_ms": 0.0,
+            "p90_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+        }
+    timings = np.array(seconds_list, dtype=np.float64) * 1000.0
+    return {
+        "count": int(timings.size),
+        "avg_ms": float(np.mean(timings)),
+        "p50_ms": float(np.percentile(timings, 50)),
+        "p90_ms": float(np.percentile(timings, 90)),
+        "p95_ms": float(np.percentile(timings, 95)),
+        "p99_ms": float(np.percentile(timings, 99)),
+    }
 
 
 def build_competition_estimate(
@@ -435,24 +464,54 @@ def build_competition_estimate(
     return estimate
 
 
-def summarize_timings(seconds_list):
-    if not seconds_list:
-        return {
-            "count": 0,
-            "avg_ms": 0.0,
-            "p50_ms": 0.0,
-            "p90_ms": 0.0,
-            "p95_ms": 0.0,
-            "p99_ms": 0.0,
-        }
-    timings = np.array(seconds_list, dtype=np.float64) * 1000.0
+def get_run_name(args, run_time):
+    if args.run_name:
+        return args.run_name
+    model_width, model_height = args.model_size
+    output_width, output_height = args.output_size
+    return f"{run_time}_fast_{model_width}x{model_height}_to_{output_width}x{output_height}"
+
+
+def build_fast_mode_summary(model_size, output_size):
+    baseline_area = BASELINE_720P_MODEL_SIZE[0] * BASELINE_720P_MODEL_SIZE[1]
+    model_area = model_size[0] * model_size[1]
+    output_area = output_size[0] * output_size[1]
     return {
-        "count": int(timings.size),
-        "avg_ms": float(np.mean(timings)),
-        "p50_ms": float(np.percentile(timings, 50)),
-        "p90_ms": float(np.percentile(timings, 90)),
-        "p95_ms": float(np.percentile(timings, 95)),
-        "p99_ms": float(np.percentile(timings, 99)),
+        "enabled": True,
+        "model_input_size": list(model_size),
+        "output_size": list(output_size),
+        "baseline_720p_model_size": list(BASELINE_720P_MODEL_SIZE),
+        "model_input_area_ratio_vs_1280x720": model_area / baseline_area,
+        "model_input_area_percent_vs_1280x720": model_area * 100.0 / baseline_area,
+        "upsample_output": model_size != output_size,
+        "upsample_scale_x": output_size[0] / model_size[0],
+        "upsample_scale_y": output_size[1] / model_size[1],
+        "output_area_ratio_vs_model_input": output_area / model_area,
+        "note": "Fast mode is training-free. It trades right-eye detail and disparity accuracy for lower model compute.",
+    }
+
+
+def export_fast_torchscript_model(model, export_path, model_size):
+    width, height = model_size
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+
+    model_cpu = Deep3DNet()
+    model_cpu.load_state_dict({key: value.detach().cpu() for key, value in model.state_dict().items()})
+    model_cpu.eval()
+
+    example_input = torch.rand(1, 18, height, width, dtype=torch.float32)
+    export_start = time.perf_counter()
+    with torch.no_grad():
+        scripted = torch.jit.trace(model_cpu, example_input, check_trace=False)
+    scripted.save(str(export_path))
+
+    return {
+        "path": to_project_relative(export_path),
+        "input_size": [width, height],
+        "format": "torchscript_trace",
+        "frozen": False,
+        "seconds": time.perf_counter() - export_start,
+        "file_mb": get_path_size_mb(export_path),
     }
 
 
@@ -462,34 +521,49 @@ def main():
     model_path = resolve_path(args.model)
     data_root = resolve_path(args.data_root)
     out_parent = resolve_path(args.out_root)
+    model_size = tuple(args.model_size)
+    output_size = tuple(args.output_size)
+
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_date, run_time = timestamp.split("_", 1)
-    run_name = args.run_name or f"{run_time}_baseline"
+    run_name = get_run_name(args, run_time)
     out_date_root = out_parent / run_date
     out_root = out_date_root / run_name
     video_root = out_root / "videos"
     vis_root = out_root / "visualizations"
     pred_root = out_root / "pred_right_frames"
+    export_root = out_root / "exported_models"
     ensure_dir(str(out_parent))
     ensure_dir(str(out_date_root))
     ensure_dir(str(out_root))
     ensure_dir(str(video_root))
     ensure_dir(str(vis_root))
+    ensure_dir(str(export_root))
     if args.save_pred_frames:
         ensure_dir(str(pred_root))
 
     clips = discover_clips(data_root)
     device = get_device(args.gpu_id)
-    model_size = tuple(args.model_size) if args.model_size else infer_model_size(model_path)
 
-    net = torch.jit.load(str(model_path), map_location="cpu")
+    # The released TorchScript model bakes in its traced 1280x720 grid, so fast
+    # mode rebuilds the dynamic PyTorch module, copies the pretrained weights,
+    # then exports a new TorchScript model at the requested fast-mode size.
+    weight_model = Deep3DNet()
+    missing_keys, unexpected_keys = load_pretrained_jit(weight_model, str(model_path), device="cpu")
+    exported_model_path = export_root / f"deep3d_fast_{model_size[0]}x{model_size[1]}_torchscript.pt"
+    export_info = export_fast_torchscript_model(weight_model, exported_model_path, model_size)
+
+    net = torch.jit.load(str(exported_model_path), map_location="cpu").eval()
     process = PreProcess()
     if device.type == "cuda":
+        torch.cuda.set_device(device)
         net = net.to(device).half()
+        net = torch.jit.freeze(net.eval())
         process = process.to(device).half()
         torch.cuda.reset_peak_memory_stats(device)
     else:
         net = net.to(device)
+        net = torch.jit.freeze(net.eval())
     net.eval()
 
     process_peak_mb_before = get_process_peak_memory_mb()
@@ -517,7 +591,6 @@ def main():
 
         first_frame = read_bgr_frame(clip["left"][0])
         source_size = (first_frame.shape[1], first_frame.shape[0])
-        output_size, simulated_1080p_input = resolve_benchmark_output_size(args, first_frame)
         resolved_output_sizes.append(list(output_size))
 
         clip_video_path = video_root / f"{clip_name}.mp4"
@@ -538,8 +611,6 @@ def main():
         clip_warm_frames = 0
         clip_warm_wall = 0.0
         clip_warm_model = 0.0
-        clip_wall_samples = []
-        clip_model_samples = []
 
         progress = tqdm(range(frame_count), desc=f"Speed {clip_name}", leave=False)
         for frame_idx in progress:
@@ -595,8 +666,6 @@ def main():
             wall_seconds = time.perf_counter() - wall_start
             clip_wall_seconds += wall_seconds
             clip_model_seconds += infer_seconds
-            clip_wall_samples.append(wall_seconds)
-            clip_model_samples.append(infer_seconds)
             total_frames += 1
             total_wall_seconds += wall_seconds
             total_model_seconds += infer_seconds
@@ -644,7 +713,7 @@ def main():
                 "source_height": source_size[1],
                 "benchmark_width": output_size[0],
                 "benchmark_height": output_size[1],
-                "simulated_1080p_input": int(simulated_1080p_input),
+                "simulated_1080p_input": int(source_size != output_size),
                 "fps": frame_count / clip_wall_seconds if clip_wall_seconds > 0 else 0.0,
                 "model_fps": frame_count / clip_model_seconds if clip_model_seconds > 0 else 0.0,
                 "steady_fps": clip_warm_frames / clip_warm_wall if clip_warm_wall > 0 else 0.0,
@@ -673,8 +742,21 @@ def main():
         "video_frame_sizes": resolved_output_sizes,
         "benchmark_policy": {
             "simulate_1080p_when_source_is_not_1080p": True,
-            "simulated_1080p_size": list(SIMULATED_1080P_SIZE),
-            "explicit_output_size_overrides_policy": bool(args.output_size),
+            "simulated_1080p_size": list(output_size),
+            "explicit_output_size_overrides_policy": True,
+            "fast_mode_downscale_before_model": True,
+            "fast_mode_upsample_after_model": model_size != output_size,
+        },
+        "fast_mode": build_fast_mode_summary(model_size, output_size),
+        "weight_loading": {
+            "source": "pretrained_torchscript_state_dict",
+            "missing_keys": missing_keys,
+            "unexpected_keys": unexpected_keys,
+            "note": "The source TorchScript file has fixed 1280x720 warp grids, so fast mode rebuilds the dynamic PyTorch model, loads its weights, and exports a new fast-size TorchScript model.",
+        },
+        "torchscript_export": {
+            **export_info,
+            "used_for_inference": True,
         },
         "clips": len(clips),
         "frames": total_frames,
@@ -722,6 +804,7 @@ def main():
                 "process_peak_mb_after reflects host RAM peak for the whole benchmark process",
                 "gpu.max_reserved_mb is the peak CUDA allocator reservation during inference",
                 "model_file_mb is the serialized TorchScript size on disk",
+                "fast_mode reduces model input area without retraining, then upsamples the output",
             ],
         },
         "per_clip": per_clip_rows,

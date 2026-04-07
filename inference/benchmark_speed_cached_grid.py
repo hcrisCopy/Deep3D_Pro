@@ -1,13 +1,9 @@
-"""Benchmark Deep3D_Pro on sequential 1080p frame folders.
+"""Benchmark Deep3D_Pro with cached backwarp base grids.
 
-The benchmark treats each clip folder under ``data_root`` as a video sequence:
-
-    clip_id/
-      left/*.png
-      right/*.png
-
-It runs temporal inference from left frames, writes a side-by-side stereo video,
-collects latency / FPS / memory stats, and saves a few visualization panels.
+This script mirrors ``inference/benchmark_speed.py`` output layout and summary
+format. It rebuilds the model from source, loads weights from the pretrained
+TorchScript file, and reuses a precomputed ``grid_sample`` base grid for fixed
+resolution inference.
 """
 
 import argparse
@@ -15,16 +11,14 @@ import csv
 import datetime as dt
 import json
 import os
-import resource
-import re
 import sys
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,24 +26,40 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.transforms import PreProcess, tensor2im
+from inference.benchmark_speed import (
+    SIMULATED_1080P_SIZE,
+    build_competition_estimate,
+    build_frame_window,
+    create_video_writer,
+    discover_clips,
+    get_device,
+    get_device_profile,
+    get_gpu_memory_snapshot,
+    get_path_size_mb,
+    get_process_peak_memory_mb,
+    infer_model_size,
+    prepare_tensor,
+    read_bgr_frame,
+    resolve_benchmark_output_size,
+    resolve_path,
+    save_visualization,
+    summarize_timings,
+    to_project_relative,
+)
+from models.deep3d_network import Deep3DNet
 from tools.file_utils import ensure_dir
-from tools.video_utils import create_video_writer
-
-
-IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp")
-SIMULATED_1080P_SIZE = (1920, 1080)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark Deep3D_Pro on sequential frame folders and export stereo videos."
+        description="Benchmark Deep3D_Pro with cached backwarp base grids."
     )
     parser.add_argument("--gpu_id", default=0, type=int, help="GPU device id, use -1 for CPU.")
     parser.add_argument(
         "--model",
         default="../data/pretrained/deep3d_v1.0_1280x720_cuda.pt",
         type=str,
-        help="TorchScript model path relative to Deep3D_Pro.",
+        help="TorchScript model path relative to Deep3D_Pro. Used as the weight source.",
     )
     parser.add_argument(
         "--data_root",
@@ -61,13 +71,13 @@ def parse_args():
         "--out_root",
         default="../data/test_on_speed",
         type=str,
-        help="Parent directory for benchmark runs. Outputs are saved under OUT_ROOT/YYYYMMDD/HHMMSS_baseline by default.",
+        help="Parent directory for benchmark runs. Outputs are saved under OUT_ROOT/YYYYMMDD/HHMMSS_cached_grid by default.",
     )
     parser.add_argument(
         "--run_name",
         default=None,
         type=str,
-        help="Optional run folder name under the date directory. Defaults to HHMMSS_baseline in UTC.",
+        help="Optional run folder name under the date directory. Defaults to HHMMSS_cached_grid in UTC.",
     )
     parser.add_argument(
         "--fps",
@@ -82,7 +92,7 @@ def parse_args():
         nargs=2,
         metavar=("WIDTH", "HEIGHT"),
         default=None,
-        help="Inference resolution expected by the TorchScript model. Defaults to parsing WIDTHxHEIGHT from the model filename.",
+        help="Inference resolution expected by the model. Defaults to parsing WIDTHxHEIGHT from the model filename.",
     )
     parser.add_argument(
         "--output_size",
@@ -137,323 +147,139 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_path(path_str):
-    path = Path(path_str)
-    if path.is_absolute():
-        return path
-    return (PROJECT_ROOT / path).resolve()
+def build_base_grid(width, height):
+    grid_x = torch.linspace(-1.0, 1.0, width, dtype=torch.float32)
+    grid_x = grid_x.view(1, 1, 1, width).expand(1, -1, height, -1)
+    grid_y = torch.linspace(-1.0, 1.0, height, dtype=torch.float32)
+    grid_y = grid_y.view(1, 1, height, 1).expand(1, -1, -1, width)
+    return torch.cat([grid_x, grid_y], dim=1)
 
 
-def infer_model_size(model_path):
-    match = re.search(r"_(\d+)x(\d+)_", os.path.basename(str(model_path)))
-    if match is None:
-        raise ValueError(
-            "Cannot infer model input size from filename. Please pass --model_size WIDTH HEIGHT."
+class CachedGridDeep3DNet(Deep3DNet):
+    def __init__(self, model_size):
+        super().__init__()
+        width, height = model_size
+        self.grid_width = int(width)
+        self.grid_height = int(height)
+        self.flow_norm_x = 2.0 / float(width - 1)
+        self.flow_norm_y = 2.0 / float(height - 1)
+        self.register_buffer("base_grid", build_base_grid(width, height), persistent=False)
+
+    def cached_backwarp(self, img, flow):
+        flow_norm = torch.empty_like(flow)
+        flow_norm[:, 0:1] = flow[:, 0:1] * self.flow_norm_x
+        flow_norm[:, 1:2] = flow[:, 1:2] * self.flow_norm_y
+
+        base_grid = self.base_grid
+        if flow.shape[0] != base_grid.shape[0]:
+            base_grid = base_grid.expand(flow.shape[0], -1, -1, -1)
+        grid = (base_grid + flow_norm).permute(0, 2, 3, 1)
+        return F.grid_sample(
+            img,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
         )
-    return int(match.group(1)), int(match.group(2))
+
+    def forward(self, imgs):
+        n, _, height, width = imgs.shape
+        if height != self.grid_height or width != self.grid_width:
+            raise ValueError(
+                f"Cached grid size is {self.grid_width}x{self.grid_height}, "
+                f"but received {width}x{height}."
+            )
+
+        bef = imgs[:, 0:3]
+        pred = imgs[:, 6:9]
+        cur = imgs[:, 9:12]
+        aft = imgs[:, 15:18]
+        onehot = imgs.new_full((n, 1, height, width), self.flow_scale)
+
+        x = torch.cat([imgs, onehot], dim=1)
+        flow, mask = self.block0(x)
+
+        w_bef = self.cached_backwarp(bef, flow[:, 0:2])
+        w_pred = self.cached_backwarp(pred, flow[:, 2:4])
+        w_cur = self.cached_backwarp(cur, flow[:, 4:6])
+        w_aft = self.cached_backwarp(aft, flow[:, 6:8])
+
+        x1_in = torch.cat([w_bef, w_pred, w_cur, w_aft, mask, onehot], dim=1)
+        flow_resid, mask_resid = self.block1(x1_in, flow)
+        flow = flow + flow_resid
+        mask = mask + mask_resid
+
+        w_bef = self.cached_backwarp(bef, flow[:, 0:2])
+        w_pred = self.cached_backwarp(pred, flow[:, 2:4])
+        w_cur = self.cached_backwarp(cur, flow[:, 4:6])
+        w_aft = self.cached_backwarp(aft, flow[:, 6:8])
+
+        x2_in = torch.cat([w_bef, w_pred, w_cur, w_aft, mask, onehot], dim=1)
+        flow_resid, mask_resid = self.block2(x2_in, flow)
+        flow = flow + flow_resid
+        mask = mask + mask_resid
+
+        w_bef = self.cached_backwarp(bef, flow[:, 0:2])
+        w_pred = self.cached_backwarp(pred, flow[:, 2:4])
+        w_cur = self.cached_backwarp(cur, flow[:, 4:6])
+        w_aft = self.cached_backwarp(aft, flow[:, 6:8])
+
+        x3_in = torch.cat([w_bef, w_pred, w_cur, w_aft, mask, onehot], dim=1)
+        flow_resid, mask_resid = self.block3(x3_in, flow)
+        flow = flow + flow_resid
+        mask = mask + mask_resid
+
+        w_bef = self.cached_backwarp(bef, flow[:, 0:2])
+        w_pred = self.cached_backwarp(pred, flow[:, 2:4])
+        w_cur = self.cached_backwarp(cur, flow[:, 4:6])
+        w_aft = self.cached_backwarp(aft, flow[:, 6:8])
+
+        mask = torch.sigmoid(mask)
+        mask_bef = mask[:, 0:1]
+        mask_aft = mask[:, 1:2]
+        mask_pred = mask[:, 2:3]
+
+        output = w_bef * mask_bef + w_cur * (1 - mask_bef)
+        output = w_aft * mask_aft + output * (1 - mask_aft)
+        output = w_pred * mask_pred + output * (1 - mask_pred)
+        return output
 
 
-def to_project_relative(path):
-    try:
-        return os.path.relpath(path, PROJECT_ROOT)
-    except ValueError:
-        return str(path)
+def load_weights_from_jit(model, jit_path):
+    jit_model = torch.jit.load(str(jit_path), map_location="cpu")
+    jit_state = {}
+    for name, param in jit_model.named_parameters():
+        jit_state[name] = param.detach()
+    for name, buf in jit_model.named_buffers():
+        jit_state[name] = buf.detach()
+    missing, unexpected = model.load_state_dict(jit_state, strict=False)
+    return missing, unexpected
 
 
-def natural_key(path):
-    name = path.name if hasattr(path, "name") else str(path)
-    parts = re.split(r"(\d+)", name)
-    return [int(part) if part.isdigit() else part.lower() for part in parts]
-
-
-def list_image_files(folder):
-    return sorted(
-        [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES],
-        key=natural_key,
-    )
-
-
-def discover_clips(data_root):
-    clips = []
-    for clip_dir in sorted([path for path in data_root.iterdir() if path.is_dir()], key=natural_key):
-        left_dir = clip_dir / "left"
-        right_dir = clip_dir / "right"
-        if not left_dir.is_dir():
-            continue
-        left_files = {path.name: path for path in list_image_files(left_dir)}
-        right_files = {}
-        if right_dir.is_dir():
-            right_files = {path.name: path for path in list_image_files(right_dir)}
-
-        common_names = sorted(
-            set(left_files) & set(right_files) if right_files else set(left_files),
-            key=natural_key,
-        )
-        if not common_names:
-            continue
-
-        clips.append(
-            {
-                "name": clip_dir.name,
-                "left": [left_files[name] for name in common_names],
-                "right": [right_files[name] for name in common_names] if right_files else None,
-            }
-        )
-    if not clips:
-        raise RuntimeError(f"No valid clips found in: {data_root}")
-    return clips
-
-
-def get_device(gpu_id):
-    if gpu_id >= 0 and torch.cuda.is_available():
-        return torch.device(f"cuda:{gpu_id}")
-    return torch.device("cpu")
-
-
-def get_process_peak_memory_mb():
-    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return rss_kb / (1024 * 1024)
-    return rss_kb / 1024.0
-
-
-def get_gpu_memory_snapshot(device):
-    if device.type != "cuda":
-        return None
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-    return {
-        "device_name": torch.cuda.get_device_name(device),
-        "allocated_mb": torch.cuda.memory_allocated(device) / (1024 ** 2),
-        "reserved_mb": torch.cuda.memory_reserved(device) / (1024 ** 2),
-        "max_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024 ** 2),
-        "max_reserved_mb": torch.cuda.max_memory_reserved(device) / (1024 ** 2),
-        "free_mb": free_bytes / (1024 ** 2),
-        "total_mb": total_bytes / (1024 ** 2),
-    }
-
-
-def get_device_profile(device):
-    profile = {
-        "device": str(device),
-        "type": device.type,
-    }
+def build_model(args, model_path, model_size, device):
+    model = CachedGridDeep3DNet(model_size)
+    missing, unexpected = load_weights_from_jit(model, model_path)
     if device.type == "cuda":
-        props = torch.cuda.get_device_properties(device)
-        profile.update(
-            {
-                "device_name": props.name,
-                "total_memory_mb": props.total_memory / (1024 ** 2),
-                "multi_processor_count": props.multi_processor_count,
-                "compute_capability": f"{props.major}.{props.minor}",
-            }
-        )
-    return profile
+        model = model.to(device).half().eval()
+    else:
+        model = model.to(device).eval()
 
-
-def get_path_size_mb(path):
-    if not path.exists():
-        return 0.0
-    if path.is_file():
-        return path.stat().st_size / (1024 ** 2)
-    total_bytes = 0
-    for file_path in path.rglob("*"):
-        if file_path.is_file():
-            total_bytes += file_path.stat().st_size
-    return total_bytes / (1024 ** 2)
-
-
-def read_bgr_frame(path, target_size=None):
-    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise RuntimeError(f"Cannot read image: {path}")
-    if target_size is not None and (frame.shape[1], frame.shape[0]) != target_size:
-        frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_LANCZOS4)
-    return frame
-
-
-def resolve_benchmark_output_size(args, first_frame):
-    if args.output_size:
-        return tuple(args.output_size), False
-    source_size = (first_frame.shape[1], first_frame.shape[0])
-    if source_size != SIMULATED_1080P_SIZE:
-        return SIMULATED_1080P_SIZE, True
-    return source_size, False
-
-
-def build_frame_window(frame_paths, alpha, target_size):
-    first_frame = torch.from_numpy(read_bgr_frame(frame_paths[0], target_size))
-    window = deque([first_frame] * alpha)
-    window.append(first_frame)
-
-    last_frame = first_frame
-    preload_end = min(len(frame_paths), alpha + 1)
-    for frame_path in frame_paths[1:preload_end]:
-        next_frame = torch.from_numpy(read_bgr_frame(frame_path, target_size))
-        last_frame = next_frame
-        window.append(next_frame)
-
-    while len(window) < 2 * alpha + 1:
-        window.append(last_frame)
-
-    return window, preload_end, last_frame
-
-
-def prepare_tensor(frame_tensor, process, device, model_size=None):
-    if model_size is not None and (frame_tensor.shape[1], frame_tensor.shape[0]) != model_size:
-        frame_np = cv2.resize(frame_tensor.numpy(), model_size, interpolation=cv2.INTER_LANCZOS4)
-        frame_tensor = torch.from_numpy(frame_np)
-    frame_tensor = frame_tensor.to(device, non_blocking=device.type == "cuda")
-    if device.type == "cuda":
-        frame_tensor = frame_tensor.half()
-    return process(frame_tensor)
-
-
-def save_visualization(save_path, left, pred, target=None):
-    diff_pred_left = cv2.absdiff(pred, left)
-
-    anaglyph = np.zeros_like(pred)
-    anaglyph[:, :, 0] = pred[:, :, 0]
-    anaglyph[:, :, 1] = pred[:, :, 1]
-    anaglyph[:, :, 2] = left[:, :, 2]
-
-    tiles = [left, pred, anaglyph, diff_pred_left]
-    labels = ["Left Input", "Pred Right", "Anaglyph", "Pred-Left Diff"]
-
-    if target is not None:
-        diff_pred_gt = cv2.absdiff(pred, target)
-        tiles.extend([target, diff_pred_gt])
-        labels.extend(["GT Right", "Pred-GT Diff"])
-
-    h, w = left.shape[:2]
-    cols = 3
-    rows = int(np.ceil(len(tiles) / cols))
-    canvas = np.zeros((h * rows, w * cols, 3), dtype=np.uint8)
-
-    for index, (tile, label) in enumerate(zip(tiles, labels)):
-        row = index // cols
-        col = index % cols
-        canvas[row * h:(row + 1) * h, col * w:(col + 1) * w] = tile
-        origin = (col * w + 16, row * h + 36)
-        cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(canvas, label, origin, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-
-    cv2.imwrite(str(save_path), canvas)
-
-
-def safe_div(numerator, denominator):
-    if denominator in (0, 0.0, None):
-        return None
-    return numerator / denominator
-
-
-def build_competition_estimate(
-    *,
-    args,
-    device_profile,
-    process_peak_mb_after,
-    gpu_memory,
-    model_file_mb,
-    total_frames,
-    total_wall_seconds,
-    total_model_seconds,
-    warm_frames,
-    warm_wall_seconds,
-    warm_model_seconds,
-):
-    pipeline_fps = safe_div(total_frames, total_wall_seconds) or 0.0
-    model_fps = safe_div(total_frames, total_model_seconds) or 0.0
-    steady_pipeline_fps = safe_div(warm_frames, warm_wall_seconds)
-    steady_model_fps = safe_div(warm_frames, warm_model_seconds)
-
-    if steady_pipeline_fps is None:
-        steady_pipeline_fps = pipeline_fps
-    if steady_model_fps is None:
-        steady_model_fps = model_fps
-
-    steady_pipeline_ms = safe_div(1000.0, steady_pipeline_fps) or 0.0
-    steady_model_ms = safe_div(1000.0, steady_model_fps) or 0.0
-    frame_budget_ms = safe_div(1000.0, args.target_fps) or 0.0
-
-    runtime_device_peak_mb = None
-    if gpu_memory is not None:
-        runtime_device_peak_mb = gpu_memory["max_reserved_mb"]
-
-    estimate = {
-        "target": {
-            "device_tops": args.target_device_tops,
-            "fps": args.target_fps,
-            "frame_budget_ms": frame_budget_ms,
-            "memory_mb": args.target_memory_mb,
-        },
-        "current_device": {
-            **device_profile,
-            "provided_current_device_tops": args.current_device_tops,
-        },
-        "current_measurement": {
-            "steady_pipeline_fps": steady_pipeline_fps,
-            "steady_model_fps": steady_model_fps,
-            "steady_pipeline_ms": steady_pipeline_ms,
-            "steady_model_ms": steady_model_ms,
-            "pipeline_meets_target_fps": bool(steady_pipeline_fps >= args.target_fps),
-            "model_meets_target_fps": bool(steady_model_fps >= args.target_fps),
-            "host_process_peak_mb": process_peak_mb_after,
-            "host_process_meets_target_memory": bool(process_peak_mb_after <= args.target_memory_mb),
-            "runtime_device_peak_mb_proxy": runtime_device_peak_mb,
-            "runtime_device_peak_meets_target_memory_proxy": None
-            if runtime_device_peak_mb is None
-            else bool(runtime_device_peak_mb <= args.target_memory_mb),
-            "model_file_mb": model_file_mb,
-            "model_file_meets_target_memory": bool(model_file_mb <= args.target_memory_mb),
-        },
-        "tops_linear_estimate": {
-            "enabled": args.current_device_tops is not None and args.current_device_tops > 0,
-            "assumption": "Assumes FPS scales linearly with effective compute TOPS on the same operator set, precision, bandwidth regime, and software stack.",
-            "warning": "This is only a rough estimate. GPU TFLOPS/TOPS and edge NPU TOPS are not directly equivalent across precision and memory systems.",
-        },
+    optimizations = {
+        "source_model": True,
+        "cached_backwarp_base_grid": True,
+        "weight_load_missing_keys": list(missing),
+        "weight_load_unexpected_keys": list(unexpected),
     }
-
-    if args.current_device_tops is not None and args.current_device_tops > 0:
-        scale = args.target_device_tops / args.current_device_tops
-        estimate["tops_linear_estimate"].update(
-            {
-                "scale_factor_target_over_current": scale,
-                "estimated_target_pipeline_fps": steady_pipeline_fps * scale,
-                "estimated_target_model_fps": steady_model_fps * scale,
-                "estimated_target_pipeline_ms": steady_pipeline_ms / scale if scale > 0 else None,
-                "estimated_target_model_ms": steady_model_ms / scale if scale > 0 else None,
-                "estimated_pipeline_meets_target_fps": bool(steady_pipeline_fps * scale >= args.target_fps),
-                "estimated_model_meets_target_fps": bool(steady_model_fps * scale >= args.target_fps),
-                "required_tops_for_pipeline_target_fps": safe_div(
-                    args.current_device_tops * args.target_fps, steady_pipeline_fps
-                ),
-                "required_tops_for_model_target_fps": safe_div(
-                    args.current_device_tops * args.target_fps, steady_model_fps
-                ),
-            }
-        )
-
-    return estimate
+    return model.eval(), optimizations
 
 
-def summarize_timings(seconds_list):
-    if not seconds_list:
-        return {
-            "count": 0,
-            "avg_ms": 0.0,
-            "p50_ms": 0.0,
-            "p90_ms": 0.0,
-            "p95_ms": 0.0,
-            "p99_ms": 0.0,
-        }
-    timings = np.array(seconds_list, dtype=np.float64) * 1000.0
-    return {
-        "count": int(timings.size),
-        "avg_ms": float(np.mean(timings)),
-        "p50_ms": float(np.percentile(timings, 50)),
-        "p90_ms": float(np.percentile(timings, 90)),
-        "p95_ms": float(np.percentile(timings, 95)),
-        "p99_ms": float(np.percentile(timings, 99)),
-    }
+class ModelRunner:
+    def __init__(self, net):
+        self.net = net
+
+    def __call__(self, input_data):
+        with torch.inference_mode():
+            return self.net(input_data)
 
 
 def main():
@@ -464,7 +290,7 @@ def main():
     out_parent = resolve_path(args.out_root)
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_date, run_time = timestamp.split("_", 1)
-    run_name = args.run_name or f"{run_time}_baseline"
+    run_name = args.run_name or f"{run_time}_cached_grid"
     out_date_root = out_parent / run_date
     out_root = out_date_root / run_name
     video_root = out_root / "videos"
@@ -482,15 +308,16 @@ def main():
     device = get_device(args.gpu_id)
     model_size = tuple(args.model_size) if args.model_size else infer_model_size(model_path)
 
-    net = torch.jit.load(str(model_path), map_location="cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats(device.index)
+
+    net, applied_optimizations = build_model(args, model_path, model_size, device)
+    model_runner = ModelRunner(net)
+
     process = PreProcess()
     if device.type == "cuda":
-        net = net.to(device).half()
         process = process.to(device).half()
-        torch.cuda.reset_peak_memory_stats(device)
-    else:
-        net = net.to(device)
-    net.eval()
 
     process_peak_mb_before = get_process_peak_memory_mb()
     device_profile = get_device_profile(device)
@@ -538,8 +365,6 @@ def main():
         clip_warm_frames = 0
         clip_warm_wall = 0.0
         clip_warm_model = 0.0
-        clip_wall_samples = []
-        clip_model_samples = []
 
         progress = tqdm(range(frame_count), desc=f"Speed {clip_name}", leave=False)
         for frame_idx in progress:
@@ -559,9 +384,8 @@ def main():
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             infer_start = time.perf_counter()
-            with torch.no_grad():
-                out = net(input_data)
-                x0 = out[0].detach()
+            out = model_runner(input_data)
+            x0 = out[0].detach()
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             infer_seconds = time.perf_counter() - infer_start
@@ -595,8 +419,6 @@ def main():
             wall_seconds = time.perf_counter() - wall_start
             clip_wall_seconds += wall_seconds
             clip_model_seconds += infer_seconds
-            clip_wall_samples.append(wall_seconds)
-            clip_model_samples.append(infer_seconds)
             total_frames += 1
             total_wall_seconds += wall_seconds
             total_model_seconds += infer_seconds
@@ -676,6 +498,7 @@ def main():
             "simulated_1080p_size": list(SIMULATED_1080P_SIZE),
             "explicit_output_size_overrides_policy": bool(args.output_size),
         },
+        "optimizations": applied_optimizations,
         "clips": len(clips),
         "frames": total_frames,
         "throughput": {
